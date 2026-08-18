@@ -22,60 +22,52 @@ import argparse
 import json
 import pickle
 import time
+import re
 
 import pandas as pd
 
 import config
-from data.data_generator import build_mock_dataset
 from data.feature_engineering import build_movie_feature_matrix
 from models.knn_recommender import build_rating_matrix, ItemKNNRecommender, UserKNNRecommender
 from models.hybrid_recommender import HybridRecommender
 from models.evaluation import compare_configurations, select_best_configuration
 
-
-def main(skip_data: bool = False, skip_eval: bool = False):
+def main(skip_eval: bool = False):
     t0 = time.time()
 
-    # ---------------------------------------------------------------
-    # 1. Data
-    # ---------------------------------------------------------------
-    if skip_data and config.USERS_CSV.exists():
-        print("[pipeline] Loading existing mock data from artifacts/ ...")
-        users_df = pd.read_csv(config.USERS_CSV)
-        movies_df = pd.read_csv(config.MOVIES_CSV)
-        ratings_df = pd.read_csv(config.RATINGS_CSV)
-    else:
-        print("[pipeline] Generating mock data ...")
-        users_df, movies_df, ratings_df = build_mock_dataset(save=True)
+    movies_df = pd.read_csv("artifacts/movies.csv")
+    ratings_df = pd.read_csv("artifacts/ratings.csv")
 
-    # ---------------------------------------------------------------
-    # 2. Feature engineering (movie content features)
-    # ---------------------------------------------------------------
-    print("[pipeline] Building movie content features ...")
+    movies_df.rename(columns={"movieId": "movie_id"}, inplace=True)
+    ratings_df.rename(columns={"userId": "user_id", "movieId": "movie_id"}, inplace=True)
+
+    def extract_decade(title):
+        match = re.search(r'\((\d{4})\)', title)
+        if match:
+            year = int(match.group(1))
+            return (year // 10) * 10
+        return 2000
+
+    movies_df['decade'] = movies_df['title'].apply(extract_decade)
+    movies_df['mpaa_rating'] = 'NR'
+
+    popularity_counts = ratings_df.groupby('movie_id').size().reset_index(name='popularity')
+    movies_df = pd.merge(movies_df, popularity_counts, on='movie_id', how='left')
+    movies_df['popularity'] = movies_df['popularity'].fillna(1.0)
+
+    users_df = pd.DataFrame({"user_id": ratings_df["user_id"].unique()})
+
     movie_features, feature_engineer = build_movie_feature_matrix(movies_df)
 
-    # ---------------------------------------------------------------
-    # 3. Model selection sweep (Task 4)
-    # ---------------------------------------------------------------
     if skip_eval:
         best_algo, best_metric, best_k = "item_knn", "cosine", config.DEFAULT_K_NEIGHBORS
-        print(f"[pipeline] Skipping eval sweep, using defaults: "
-              f"{best_algo}/{best_metric}/k={best_k}")
     else:
-        print("[pipeline] Running evaluation sweep for model selection ...")
         results = compare_configurations(users_df, movies_df, ratings_df)
         best = select_best_configuration(results, sort_by="rmse")
         best_algo, best_metric, best_k = best["algorithm"], best["similarity_metric"], best["k"]
-        print(f"[pipeline] Best config by RMSE: {best_algo} / {best_metric} / k={best_k}")
         with open(config.EVAL_REPORT_JSON, "w") as f:
             json.dump({"all_results": results, "best_by_rmse": best}, f, indent=2)
 
-    # ---------------------------------------------------------------
-    # 4. Fit FINAL production models on the FULL rating data
-    #    (evaluation sweep used a held-out split; production model uses
-    #    all available signal).
-    # ---------------------------------------------------------------
-    print("[pipeline] Fitting final production models on full data ...")
     rating_matrix = build_rating_matrix(ratings_df, users_df, movies_df)
     item_knn = ItemKNNRecommender(k=best_k, metric=best_metric).fit(rating_matrix)
     user_knn = UserKNNRecommender(k=best_k, metric=best_metric).fit(rating_matrix)
@@ -89,9 +81,6 @@ def main(skip_data: bool = False, skip_eval: bool = False):
         ratings_df=ratings_df,
     )
 
-    # ---------------------------------------------------------------
-    # 5. Serialize for the API
-    # ---------------------------------------------------------------
     artifact = {
         "hybrid_recommender": hybrid,
         "movies_df": movies_df,
@@ -102,14 +91,8 @@ def main(skip_data: bool = False, skip_eval: bool = False):
     with open(config.MODEL_PICKLE, "wb") as f:
         pickle.dump(artifact, f)
 
-    elapsed = time.time() - t0
-    print(f"[pipeline] Saved production artifact -> {config.MODEL_PICKLE}")
-    print(f"[pipeline] Done in {elapsed:.1f}s")
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--skip-data", action="store_true", help="Reuse existing CSVs")
-    parser.add_argument("--skip-eval", action="store_true", help="Skip the evaluation sweep")
+    parser.add_argument("--skip-eval", action="store_true")
     args = parser.parse_args()
-    main(skip_data=args.skip_data, skip_eval=args.skip_eval)
+    main(skip_eval=args.skip_eval)
